@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import logging
 import pandas as pd
-import pandas_ta as ta
 
 
 # ============================================================
@@ -25,7 +24,7 @@ if not logger.handlers:
 # ============================================================
 
 class EMAComputationError(Exception):
-    """Erro ao calcular EMA."""
+    pass
 
 
 # ============================================================
@@ -37,22 +36,9 @@ def compute_ema(
     period: int,
     price_col: str = "close",
 ) -> pd.Series:
-    """
-    Calcula EMA utilizando pandas-ta.
 
-    Parâmetros:
-        df: DataFrame com OHLCV
-        period: período da EMA
-        price_col: coluna de preço (default: close)
-
-    Retorno:
-        pd.Series com EMA
-
-    Raises:
-        EMAComputationError
-    """
-
-    logger.info(f"Calculando EMA | period={period}")
+    if df.empty:
+        raise EMAComputationError("DataFrame vazio")
 
     if price_col not in df.columns:
         raise EMAComputationError(f"Coluna não encontrada: {price_col}")
@@ -61,10 +47,27 @@ def compute_ema(
         raise EMAComputationError("Período da EMA deve ser > 0")
 
     try:
-        ema = ta.ema(df[price_col], length=period)
+        price = df[price_col]
 
-        if ema is None or ema.isna().all():
-            raise EMAComputationError("EMA retornou valores inválidos")
+        ema = price.ewm(
+            span=period,
+            adjust=False,
+            min_periods=period
+        ).mean()
+
+        ema.name = f"ema_{period}"
+
+        # ====================================================
+        # LOG (opcional, leve)
+        # ====================================================
+
+        warmup = ema.isna().sum()
+
+        logger.info(
+            "EMA calculada | period=%d | warmup=%d",
+            period,
+            warmup,
+        )
 
     except Exception as e:
         raise EMAComputationError(f"Erro ao calcular EMA: {e}")

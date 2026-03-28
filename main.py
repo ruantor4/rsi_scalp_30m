@@ -10,25 +10,17 @@ import pandas as pd
 from src.core.logger import get_logger
 from src.data.fetcher import fetch_all_klines, save_csv
 from src.data.loader import load_csv
-
+from src.config.settings import (
+    SYMBOLS,
+    INTERVAL,
+    START_DATE,
+    END_DATE,
+    RAW_DIR,
+    PROCESSED_DIR,
+    MAX_INVALID_RATIO,
+)
 
 logger = get_logger("main")
-
-
-# ============================================================
-# CONFIG
-# ============================================================
-
-SYMBOL = "BTCUSDT"
-INTERVAL = "30m"
-
-START_DATE = "2022-01-01"
-END_DATE   = "2025-01-01"
-
-RAW_PATH = Path("data/raw/btcusdt_30m.csv")
-PROCESSED_DIR = Path("data/processed")
-
-MAX_SYNTHETIC_RATIO = 0.01
 
 
 # ============================================================
@@ -41,35 +33,133 @@ def to_milliseconds(date_str: str) -> int:
     return int(dt.timestamp() * 1000)
 
 
-def get_last_timestamp(path: Path) -> Optional[int]:
+def interval_to_ms(interval: str) -> int:
+    if interval.endswith("m"):
+        return int(interval[:-1]) * 60 * 1000
+    if interval.endswith("h"):
+        return int(interval[:-1]) * 60 * 60 * 1000
+    raise ValueError(f"Intervalo inválido: {interval}")
+
+
+def read_raw_csv(path: Path) -> Optional[pd.DataFrame]:
     if not path.exists():
         return None
 
     try:
         df = pd.read_csv(path)
-
         if df.empty:
             return None
-
-        last_ts = pd.to_datetime(df["timestamp"]).max()
-
-        return int(last_ts.timestamp() * 1000)
-
+        return df
     except Exception as e:
-        logger.warning(f"Erro ao ler último timestamp: {e}")
+        logger.warning(f"Erro ao ler CSV raw: {e}")
         return None
+
+
+def get_last_timestamp(df: Optional[pd.DataFrame]) -> Optional[int]:
+    if df is None or df.empty:
+        return None
+
+    ts = pd.to_datetime(df["timestamp"], utc=True, errors="coerce")
+    last_ts = ts.max()
+
+    return int(last_ts.timestamp() * 1000)
 
 
 def log_dataset_info(df: pd.DataFrame) -> None:
     logger.info(f"Rows: {len(df)}")
     logger.info(f"Range: {df['timestamp'].min()} → {df['timestamp'].max()}")
 
-    synthetic_ratio = df["is_synthetic"].mean()
-    logger.info(f"Synthetic ratio: {synthetic_ratio:.6f}")
+    invalid_ratio = (~df["is_valid"]).mean()
+    logger.info(f"Invalid ratio: {invalid_ratio:.6f}")
 
     buffer = io.StringIO()
     df.info(buf=buffer)
     logger.info("\n" + buffer.getvalue())
+
+
+# ============================================================
+# PROCESS SYMBOL
+# ============================================================
+
+def process_symbol(symbol: str) -> pd.DataFrame:
+    logger.info(f"=== PROCESSING {symbol} ===")
+
+    raw_path = RAW_DIR / f"{symbol.lower()}_{INTERVAL}.csv"
+
+    end_ts = to_milliseconds(END_DATE)
+    interval_ms = interval_to_ms(INTERVAL)
+
+    df_old = read_raw_csv(raw_path)
+    last_ts = get_last_timestamp(df_old)
+
+    if last_ts:
+        logger.info("Modo incremental")
+        start_ts = last_ts + interval_ms
+    else:
+        logger.info("Modo full load")
+        start_ts = to_milliseconds(START_DATE)
+
+    # ====================================================
+    # FETCH
+    # ====================================================
+
+    if last_ts and start_ts >= end_ts:
+        logger.info("Dataset já atualizado")
+        df_new = pd.DataFrame()
+    else:
+        try:
+            df_new = fetch_all_klines(
+                symbol=symbol,
+                interval=INTERVAL,
+                start_ts=start_ts,
+                end_ts=end_ts,
+            )
+        except Exception as e:
+            logger.warning(f"Fetch falhou {symbol}: {e}")
+            df_new = pd.DataFrame()
+
+    # ====================================================
+    # MERGE RAW
+    # ====================================================
+
+    if df_old is not None and not df_new.empty:
+        df_raw = pd.concat([df_old, df_new], ignore_index=True)
+    elif df_old is not None:
+        df_raw = df_old
+    else:
+        df_raw = df_new
+
+    if df_raw is None or df_raw.empty:
+        raise RuntimeError(f"{symbol} sem dados")
+
+    df_raw = (
+        df_raw
+        .sort_values("timestamp")
+        .drop_duplicates(subset="timestamp", keep="last")
+        .reset_index(drop=True)
+    )
+
+    save_csv(df_raw, symbol, INTERVAL)
+
+    # ====================================================
+    # LOAD (NORMALIZAÇÃO)
+    # ====================================================
+
+    df = load_csv(symbol=symbol, timeframe=INTERVAL)
+
+    if df.empty:
+        raise RuntimeError(f"{symbol} dataset vazio")
+
+    invalid_ratio = (~df["is_valid"]).mean()
+
+    if invalid_ratio > MAX_INVALID_RATIO:
+        raise RuntimeError(
+            f"{symbol} dataset ruim: {invalid_ratio:.6f}"
+        )
+
+    df["symbol"] = symbol
+
+    return df
 
 
 # ============================================================
@@ -79,156 +169,70 @@ def log_dataset_info(df: pd.DataFrame) -> None:
 def main() -> None:
     logger.info("=== START PIPELINE ===")
 
-    logger.info(f"Symbol: {SYMBOL}")
-    logger.info(f"Interval: {INTERVAL}")
-    logger.info(f"Start: {START_DATE}")
-    logger.info(f"End: {END_DATE}")
+    all_dfs = []
 
-    try:
-        end_ts = to_milliseconds(END_DATE)
+    for symbol in SYMBOLS:
+        df_symbol = process_symbol(symbol)
+        all_dfs.append(df_symbol)
 
-        # ====================================================
-        # INCREMENTAL LOGIC
-        # ====================================================
+    if not all_dfs:
+        raise RuntimeError("Nenhum dataset gerado")
 
-        last_ts = get_last_timestamp(RAW_PATH)
+    df_final = (
+        pd.concat(all_dfs)
+        .sort_values(["symbol", "timestamp"])
+        .reset_index(drop=True)
+    )
 
-        if last_ts:
-            logger.info("Modo incremental")
+    # ====================================================
+    # SAVE
+    # ====================================================
 
-            start_ts = last_ts + 1
-            df_old = pd.read_csv(RAW_PATH)
+    PROCESSED_DIR.mkdir(parents=True, exist_ok=True)
 
-        else:
-            logger.info("Modo full load")
+    version = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
 
-            start_ts = to_milliseconds(START_DATE)
-            df_old = None
+    # versionado
+    versioned_path = PROCESSED_DIR / f"dataset_{version}.parquet"
 
-        # ====================================================
-        # FETCH
-        # ====================================================
+    df_final.to_parquet(
+        versioned_path,
+        index=False,
+        compression="snappy",
+    )
 
-        df_new = fetch_all_klines(
-            symbol=SYMBOL,
-            interval=INTERVAL,
-            start_ts=start_ts,
-            end_ts=end_ts,
-        )
+    logger.info(f"Saved parquet: {versioned_path}")
 
-        # ====================================================
-        # MERGE RAW (CORRIGIDO)
-        # ====================================================
+    # 🔥 latest (ESSENCIAL)
+    latest_path = PROCESSED_DIR / "dataset.parquet"
 
-        if df_old is not None and not df_new.empty:
-            df_raw = pd.concat([df_old, df_new], ignore_index=True)
-        elif df_old is not None:
-            df_raw = df_old
-        else:
-            df_raw = df_new
+    df_final.to_parquet(
+        latest_path,
+        index=False,
+        compression="snappy",
+    )
 
-        # 🔴 FIX CRÍTICO: normalização do RAW
-        if not df_raw.empty:
-            before = len(df_raw)
+    logger.info(f"Saved latest dataset: {latest_path}")
 
-            df_raw = (
-                df_raw
-                .sort_values("timestamp")
-                .drop_duplicates(subset=["timestamp"], keep="last")
-                .reset_index(drop=True)
-            )
+    # metadata
+    metadata_path = versioned_path.with_suffix(".json")
 
-            after = len(df_raw)
+    metadata = {
+        "symbols": SYMBOLS,
+        "interval": INTERVAL,
+        "rows": len(df_final),
+        "start": str(df_final["timestamp"].min()),
+        "end": str(df_final["timestamp"].max()),
+        "created_at": datetime.now(timezone.utc).isoformat(),
+    }
 
-            if before != after:
-                logger.warning(f"RAW deduplicado: {before} → {after}")
+    pd.DataFrame([metadata]).to_json(metadata_path, orient="records")
 
-        save_csv(df_raw, str(RAW_PATH))
+    logger.info(f"Metadata salvo: {metadata_path}")
 
-        # ====================================================
-        # LOAD (VALIDAÇÃO)
-        # ====================================================
+    log_dataset_info(df_final)
 
-        df = load_csv(
-            path=str(RAW_PATH),
-            timeframe=INTERVAL,
-        )
-
-        if df.empty:
-            raise RuntimeError("Dataset vazio após load")
-
-        synthetic_ratio = df["is_synthetic"].mean()
-
-        if synthetic_ratio > MAX_SYNTHETIC_RATIO:
-            raise RuntimeError(
-                f"Dataset ruim: synthetic_ratio={synthetic_ratio:.6f}"
-            )
-
-        # ====================================================
-        # VERSIONAMENTO
-        # ====================================================
-
-        PROCESSED_DIR.mkdir(parents=True, exist_ok=True)
-
-        version = datetime.utcnow().strftime("%Y%m%d_%H%M%S")
-        base_name = f"{SYMBOL.lower()}_{INTERVAL}_{version}"
-
-        parquet_path = PROCESSED_DIR / f"{base_name}.parquet"
-        metadata_path = PROCESSED_DIR / f"{base_name}.json"
-
-        # ====================================================
-        # SAVE DATASET
-        # ====================================================
-
-        try:
-            df.to_parquet(
-                parquet_path,
-                index=False,
-                compression="snappy",
-            )
-            logger.info(f"Saved parquet: {parquet_path}")
-
-        except Exception as e:
-            fallback_path = parquet_path.with_suffix(".csv")
-
-            df.to_csv(fallback_path, index=False)
-
-            logger.warning(
-                f"Parquet falhou ({e}), fallback CSV usado: {fallback_path}"
-            )
-
-        # ====================================================
-        # SAVE METADATA
-        # ====================================================
-
-        metadata = {
-            "symbol": SYMBOL,
-            "interval": INTERVAL,
-            "rows": len(df),
-            "start": str(df["timestamp"].min()),
-            "end": str(df["timestamp"].max()),
-            "synthetic_ratio": float(synthetic_ratio),
-            "created_at": datetime.utcnow().isoformat(),
-        }
-
-        pd.DataFrame([metadata]).to_json(
-            metadata_path,
-            orient="records",
-        )
-
-        logger.info(f"Metadata salvo: {metadata_path}")
-
-        # ====================================================
-        # DEBUG
-        # ====================================================
-
-        log_dataset_info(df)
-
-        logger.info("=== PIPELINE OK ===")
-
-    except Exception as e:
-        logger.exception(f"Erro no pipeline: {e}")
-        raise
+    logger.info("=== PIPELINE OK ===")
 
 
 if __name__ == "__main__":

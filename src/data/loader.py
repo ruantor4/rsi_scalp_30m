@@ -2,9 +2,13 @@ from __future__ import annotations
 
 from typing import List
 import pandas as pd
+import numpy as np
 
 from src.core.logger import get_logger
-
+from src.config.settings import (
+    RAW_DIR,
+    INTERVAL,
+)
 
 logger = get_logger("loader")
 
@@ -23,7 +27,13 @@ REQUIRED_COLUMNS: List[str] = [
 ]
 
 
-def load_csv(path: str, timeframe: str) -> pd.DataFrame:
+def load_csv(
+    symbol: str,
+    timeframe: str = INTERVAL,
+) -> pd.DataFrame:
+
+    path = RAW_DIR / f"{symbol.lower()}_{timeframe}.csv"
+
     logger.info(f"Load start | {path}")
 
     try:
@@ -34,12 +44,22 @@ def load_csv(path: str, timeframe: str) -> pd.DataFrame:
     df = _validate_schema(df)
     df = _normalize_types(df)
     df = _sort_and_deduplicate(df)
-    df = _ensure_continuity(df, timeframe)
-    _final_validation(df, timeframe)
+    df = _detect_gaps(df, timeframe)
+    _final_validation(df)
 
-    logger.info(f"Load done | rows={len(df)}")
+    logger.info(
+        "Load done | rows=%d | valid=%d | invalid=%d",
+        len(df),
+        df["is_valid"].sum(),
+        (~df["is_valid"]).sum(),
+    )
 
     return df
+
+
+# ====================================================
+# INTERNALS
+# ====================================================
 
 
 def _validate_schema(df: pd.DataFrame) -> pd.DataFrame:
@@ -52,30 +72,80 @@ def _validate_schema(df: pd.DataFrame) -> pd.DataFrame:
 def _normalize_types(df: pd.DataFrame) -> pd.DataFrame:
     df = df.copy()
 
-    df["timestamp"] = pd.to_datetime(df["timestamp"], unit="ms", utc=True)
+    # ====================================================
+    # TIMESTAMP (COESO COM FETCHER)
+    # ====================================================
 
-    for col in ["open", "high", "low", "close", "volume"]:
-        df[col] = pd.to_numeric(df[col], errors="coerce")
+    df["timestamp"] = pd.to_datetime(
+        df["timestamp"],
+        utc=True,
+        errors="coerce",
+    )
 
-    if df[REQUIRED_COLUMNS].isnull().any().any():
-        raise DataValidationError("Nulls após coerção")
+    invalid_ts = df["timestamp"].isna()
 
-    # sanity check OHLC
-    if (df["high"] < df["low"]).any():
-        raise DataValidationError("High < Low detectado")
+    if invalid_ts.any():
+        logger.warning(
+            "Timestamps inválidos removidos: %d",
+            invalid_ts.sum(),
+        )
+        df = df[~invalid_ts].reset_index(drop=True)
 
-    if (df["open"] > df["high"]).any() or (df["open"] < df["low"]).any():
-        raise DataValidationError("Open fora do range")
+    # ====================================================
+    # NUMÉRICOS
+    # ====================================================
 
-    if (df["close"] > df["high"]).any() or (df["close"] < df["low"]).any():
-        raise DataValidationError("Close fora do range")
+    numeric_cols = ["open", "high", "low", "close", "volume"]
+
+    df[numeric_cols] = df[numeric_cols].apply(
+        pd.to_numeric,
+        errors="coerce",
+    )
+
+    # ====================================================
+    # QUALIDADE
+    # ====================================================
+
+    df["is_valid"] = True
+
+    null_mask = df[REQUIRED_COLUMNS].isnull().any(axis=1)
+    df.loc[null_mask, "is_valid"] = False
+
+    # sanity OHLC
+    invalid_ohlc = (
+        (df["high"] < df["low"]) |
+        (df["open"] > df["high"]) |
+        (df["open"] < df["low"]) |
+        (df["close"] > df["high"]) |
+        (df["close"] < df["low"])
+    )
+
+    df.loc[invalid_ohlc, "is_valid"] = False
+
+    # ====================================================
+    # BASE FEATURES
+    # ====================================================
+
+    df["return"] = df["close"].pct_change()
+
+    ratio = df["close"] / df["close"].shift(1)
+    ratio = ratio.replace([np.inf, -np.inf], np.nan)
+    ratio[ratio <= 0] = np.nan
+
+    df["log_return"] = np.log(ratio)
+
+    df["volatility"] = df["return"].rolling(20).std()
 
     return df
 
 
 def _sort_and_deduplicate(df: pd.DataFrame) -> pd.DataFrame:
     df = df.sort_values("timestamp")
-    df = df.drop_duplicates("timestamp", keep="last")
+
+    df = df.drop_duplicates(
+        subset="timestamp",
+        keep="last",
+    )
 
     if not df["timestamp"].is_monotonic_increasing:
         raise DataValidationError("Timestamp não monotônico")
@@ -83,57 +153,47 @@ def _sort_and_deduplicate(df: pd.DataFrame) -> pd.DataFrame:
     return df.reset_index(drop=True)
 
 
-def _ensure_continuity(df: pd.DataFrame, timeframe: str) -> pd.DataFrame:
-    freq = _timeframe_to_freq(timeframe)
+def _detect_gaps(df: pd.DataFrame, timeframe: str) -> pd.DataFrame:
+    df = df.copy()
 
-    full_index = pd.date_range(
-        start=df["timestamp"].iloc[0],
-        end=df["timestamp"].iloc[-1],
-        freq=freq,
-        tz="UTC",
-    )
+    expected = pd.Timedelta(_timeframe_to_freq(timeframe))
 
-    df = df.set_index("timestamp")
-    df["is_synthetic"] = False
+    df["delta"] = df["timestamp"].diff()
 
-    df = df.reindex(full_index)
+    tolerance = pd.Timedelta(seconds=1)
 
-    # garantir primeiro valor válido
-    if df.iloc[0][["open", "high", "low", "close"]].isna().any():
-        raise DataValidationError("Primeiro candle inválido após reindex")
+    df["gap"] = (df["delta"] - expected).abs() > tolerance
 
-    # 🔴 FIX: estava dentro do if (errado)
-    synthetic_mask = df["open"].isna()
+    df.loc[0, "gap"] = False
 
-    df[["open", "high", "low", "close"]] = df[
-        ["open", "high", "low", "close"]
-    ].ffill()
+    gap_count = df["gap"].sum()
 
-    df.loc[synthetic_mask, "volume"] = 0.0
-    df["volume"] = df["volume"].fillna(0.0)
+    if gap_count > 0:
+        logger.warning(
+            "Gaps detectados: %d | expected=%s",
+            gap_count,
+            expected,
+        )
 
-    df.loc[synthetic_mask, "is_synthetic"] = True
+    df["has_gap"] = df["gap"]
 
-    df = df.reset_index().rename(columns={"index": "timestamp"})
-
-    df["is_synthetic"] = df["is_synthetic"].astype(bool)
-
-    return df
+    return df.drop(columns=["delta"])
 
 
-def _final_validation(df: pd.DataFrame, timeframe: str) -> None:
+def _final_validation(df: pd.DataFrame) -> None:
     if df["timestamp"].duplicated().any():
         raise DataValidationError("Duplicatas após processamento")
 
     if not df["timestamp"].is_monotonic_increasing:
         raise DataValidationError("Timestamp não monotônico final")
 
-    expected = pd.Timedelta(_timeframe_to_freq(timeframe))
+    if "is_valid" not in df.columns:
+        raise DataValidationError("Coluna is_valid ausente")
 
-    diffs = df["timestamp"].diff().dropna()
+    invalid_count = (~df["is_valid"]).sum()
 
-    if diffs.nunique() != 1 or diffs.iloc[0] != expected:
-        raise DataValidationError("Dataset não contínuo")
+    if invalid_count > 0:
+        logger.warning("Linhas inválidas: %d", invalid_count)
 
 
 def _timeframe_to_freq(tf: str) -> str:

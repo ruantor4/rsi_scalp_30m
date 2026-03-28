@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import logging
 import pandas as pd
-import pandas_ta as ta
 
 
 # ============================================================
@@ -25,7 +24,7 @@ if not logger.handlers:
 # ============================================================
 
 class RSIComputationError(Exception):
-    """Erro ao calcular RSI."""
+    pass
 
 
 # ============================================================
@@ -37,34 +36,44 @@ def compute_rsi(
     period: int,
     price_col: str = "close",
 ) -> pd.Series:
-    """
-    Calcula RSI utilizando pandas-ta.
 
-    Parâmetros:
-        df: DataFrame com OHLCV
-        period: período do RSI
-        price_col: coluna de preço (default: close)
-
-    Retorno:
-        pd.Series com RSI
-
-    Raises:
-        RSIComputationError
-    """
-
-    logger.info(f"Calculando RSI | period={period}")
+    if df.empty:
+        raise RSIComputationError("DataFrame vazio")
 
     if price_col not in df.columns:
         raise RSIComputationError(f"Coluna não encontrada: {price_col}")
 
     if period <= 0:
-        raise RSIComputationError("Período do RSI deve ser > 0")
+        raise RSIComputationError("Período inválido")
 
     try:
-        rsi = ta.rsi(df[price_col], length=period)
+        price = df[price_col]
 
-        if rsi is None or rsi.isna().all():
-            raise RSIComputationError("RSI retornou valores inválidos")
+        delta = price.diff()
+
+        gain = delta.clip(lower=0)
+        loss = -delta.clip(upper=0)
+
+        # Wilder smoothing
+        avg_gain = gain.ewm(alpha=1 / period, min_periods=period, adjust=False).mean()
+        avg_loss = loss.ewm(alpha=1 / period, min_periods=period, adjust=False).mean()
+
+        rs = avg_gain / avg_loss
+        rsi = 100 - (100 / (1 + rs))
+
+        rsi.name = f"rsi_{period}"
+
+        # ====================================================
+        # LOG
+        # ====================================================
+
+        warmup = rsi.isna().sum()
+
+        logger.info(
+            "RSI calculado | period=%d | warmup=%d",
+            period,
+            warmup,
+        )
 
     except Exception as e:
         raise RSIComputationError(f"Erro ao calcular RSI: {e}")

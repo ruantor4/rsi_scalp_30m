@@ -8,18 +8,24 @@ import requests
 import pandas as pd
 
 from src.core.logger import get_logger
+from src.config.settings import (
+    INTERVAL,
+    LIMIT,
+    REQUEST_TIMEOUT,
+    MAX_RETRIES,
+    BACKOFF_BASE,
+    FETCH_SLEEP,
+    BINANCE_BASE_URL,
+)
 
-
-BASE_URL = "https://api.binance.com/api/v3/klines"
-
-DEFAULT_LIMIT = 1000
-REQUEST_TIMEOUT = 10
-
-MAX_RETRIES = 5
-BACKOFF_BASE = 0.5
+DEFAULT_LIMIT = LIMIT
 
 logger = get_logger("fetcher")
 
+
+# ============================================================
+# EXCEPTIONS
+# ============================================================
 
 class BinanceAPIError(Exception):
     pass
@@ -28,6 +34,10 @@ class BinanceAPIError(Exception):
 class BinanceRateLimitError(BinanceAPIError):
     pass
 
+
+# ============================================================
+# HELPERS
+# ============================================================
 
 def _interval_to_minutes(interval: str) -> int:
     if interval.endswith("m"):
@@ -41,6 +51,10 @@ def align_timestamp(ts: int, interval_minutes: int) -> int:
     interval_ms = interval_minutes * 60 * 1000
     return ts - (ts % interval_ms)
 
+
+# ============================================================
+# API REQUEST
+# ============================================================
 
 def _request_klines(
     symbol: str,
@@ -63,7 +77,7 @@ def _request_klines(
     for attempt in range(MAX_RETRIES):
         try:
             response = requests.get(
-                BASE_URL,
+                BINANCE_BASE_URL,
                 params=params,
                 timeout=REQUEST_TIMEOUT,
             )
@@ -71,9 +85,8 @@ def _request_klines(
             if response.status_code == 200:
                 data = response.json()
 
-                # 🔴 validação crítica de contrato
                 if not isinstance(data, list):
-                    raise BinanceAPIError("Resposta inválida da API (não é lista)")
+                    raise BinanceAPIError("Resposta inválida")
 
                 return data or []
 
@@ -84,20 +97,27 @@ def _request_klines(
 
         except (BinanceRateLimitError, requests.RequestException) as e:
             sleep = BACKOFF_BASE * (2 ** attempt)
-            logger.warning(f"{e} | retry {sleep:.2f}s")
+            logger.warning(f"{e} | retry={attempt} sleep={sleep:.2f}s")
             time.sleep(sleep)
 
     raise BinanceAPIError("Falha após retries")
 
 
+# ============================================================
+# FETCH MAIN
+# ============================================================
+
 def fetch_all_klines(
     symbol: str,
-    interval: str,
-    start_ts: int,
-    end_ts: Optional[int],
+    interval: str = INTERVAL,
+    start_ts: int = 0,
+    end_ts: Optional[int] = None,
     limit: int = DEFAULT_LIMIT,
-    sleep: float = 0.1,
+    sleep: float = FETCH_SLEEP,
 ) -> pd.DataFrame:
+
+    if start_ts == 0:
+        raise ValueError("start_ts não pode ser 0")
 
     logger.info(f"Fetch start | {symbol} {interval}")
 
@@ -122,6 +142,7 @@ def fetch_all_klines(
         )
 
         if not batch:
+            logger.warning("Batch vazio - encerrando")
             break
 
         all_rows.extend(batch)
@@ -134,7 +155,9 @@ def fetch_all_klines(
 
         current = last_open + interval_ms
 
-        logger.info(f"Batch {len(batch)} | Total {len(all_rows)}")
+        logger.info(
+            f"Batch={len(batch)} | Total={len(all_rows)} | next_ts={current}"
+        )
 
         if len(batch) < limit:
             break
@@ -146,10 +169,17 @@ def fetch_all_klines(
 
     df = _normalize(all_rows)
 
+    if df.empty:
+        raise BinanceAPIError("Nenhum dado retornado da API")
+
     logger.info(f"Fetch done | rows={len(df)}")
 
     return df
 
+
+# ============================================================
+# NORMALIZE
+# ============================================================
 
 def _normalize(data: List) -> pd.DataFrame:
 
@@ -171,13 +201,51 @@ def _normalize(data: List) -> pd.DataFrame:
         ],
     )
 
-    return df[["timestamp", "open", "high", "low", "close", "volume"]]
+    df = df[["timestamp", "open", "high", "low", "close", "volume"]]
+
+    # ====================================================
+    # TIMESTAMP PADRONIZADO (CRÍTICO)
+    # ====================================================
+
+    df["timestamp"] = pd.to_datetime(
+        df["timestamp"],
+        unit="ms",
+        utc=True,
+    )
+
+    df["timestamp"] = df["timestamp"].dt.strftime("%Y-%m-%d %H:%M:%S")
+
+    # ====================================================
+    # NUMÉRICOS
+    # ====================================================
+
+    for col in ["open", "high", "low", "close", "volume"]:
+        df[col] = df[col].astype("float64")
+
+    # ====================================================
+    # CLEAN
+    # ====================================================
+
+    df = (
+        df.sort_values("timestamp")
+        .drop_duplicates(subset="timestamp")
+        .reset_index(drop=True)
+    )
+
+    return df
 
 
-def save_csv(df: pd.DataFrame, path: str) -> None:
-    path_obj = Path(path)
-    path_obj.parent.mkdir(parents=True, exist_ok=True)
+# ============================================================
+# SAVE
+# ============================================================
 
-    df.to_csv(path_obj, index=False)
+def save_csv(df: pd.DataFrame, symbol: str, interval: str) -> None:
+    path = Path(f"data/raw/{symbol.lower()}_{interval}.csv")
+    path.parent.mkdir(parents=True, exist_ok=True)
 
-    logger.info(f"CSV salvo: {path_obj}")
+    if df.empty:
+        raise ValueError("Tentativa de salvar CSV vazio")
+
+    df.to_csv(path, index=False)
+
+    logger.info(f"CSV salvo: {path}")
